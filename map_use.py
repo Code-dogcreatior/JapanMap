@@ -61,4 +61,4 @@ def serve_tiles(z, x, filename):
     return send_from_directory(tile_subdir, filename)
 
 if __name__ == "__main__":    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=False)

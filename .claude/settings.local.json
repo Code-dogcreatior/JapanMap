@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(cmd.exe /c \"e:\\\\\\\\fumigo\\\\\\\\map\\\\\\\\start_map_all.bat\")"
+    ]
+  }
+}

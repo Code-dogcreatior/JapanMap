@@ -31,7 +31,7 @@
        </div>
  
        <div class="nav-actions">
-         <div class="user-avatar">Admin</div>
+         <div class="version-tag">GSI · Japan</div>
        </div>
      </nav>
  
@@ -61,8 +61,9 @@
  .saas-app-layout {
    display: flex;
    flex-direction: column;
-   height: 100vh;
-   width: 100vw;
+  height: 100dvh;
+  width: 100%;
+  min-height: 0;
    overflow: hidden;
    background-color: #f8fafc;
    font-family: 'Inter', system-ui, -apple-system, sans-serif;
@@ -166,14 +167,12 @@
    justify-content: flex-end;
  }
  
- .user-avatar {
-   background: #e2e8f0;
-   color: #475569;
-   font-size: 0.85rem;
+ .version-tag {
+   font-size: 0.78rem;
    font-weight: 600;
-   padding: 0.5rem 1rem;
-   border-radius: 20px;
-   border: 1px solid #cbd5e1;
+   color: #94a3b8;
+   letter-spacing: 0.05em;
+   text-transform: uppercase;
  }
  
  /* 路由容器 */
@@ -181,5 +180,6 @@
    flex: 1;
    position: relative;
    overflow: hidden;
+  min-height: 0;
  }
  </style>

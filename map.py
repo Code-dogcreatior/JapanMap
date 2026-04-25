@@ -3,6 +3,7 @@ import time
 import math
 import json
 import asyncio
+import threading
 from pathlib import Path
 from typing import List, Dict, Tuple
 from flask import Flask, request, jsonify, send_from_directory
@@ -65,7 +66,8 @@ class JapanMapTileDownloader:
         }
         
         self.session = None
-        
+        self._lock = threading.Lock()
+
         # 下载状态追踪
         self.current_download = {
             "is_downloading": False,
@@ -168,11 +170,12 @@ class JapanMapTileDownloader:
     def add_log(self, message: str, log_type: str = "info"):
         """添加日志"""
         timestamp = time.strftime("%H:%M:%S")
-        self.current_download["logs"].append({
-            "time": timestamp,
-            "message": message,
-            "type": log_type
-        })
+        with self._lock:
+            self.current_download["logs"].append({
+                "time": timestamp,
+                "message": message,
+                "type": log_type
+            })
     
     async def download_tiles_async(self, region: str, zoom_min: int = 5, zoom_max: int = 8, 
                                  max_concurrent: int = 400, max_retries: int = 3, retry_delay: float = 1.0):
@@ -229,8 +232,9 @@ class JapanMapTileDownloader:
                     self.current_download["fail"] += 1
                     self.add_log(message, "error")
                 
-                self.current_download["current"] += 1
-                self.current_download["progress"] = int((self.current_download["current"] / total) * 100)
+                with self._lock:
+                    self.current_download["current"] += 1
+                    self.current_download["progress"] = int((self.current_download["current"] / total) * 100)
                 
                 # 实时更新日志
                 if self.current_download["current"] % 50 == 0 or self.current_download["current"] == total:
@@ -313,9 +317,12 @@ downloader = JapanMapTileDownloader(output_dir="map_tiles")
 
 @app.route('/api/regions', methods=['GET'])
 def get_regions():
-    """获取可用区域列表"""
+    """获取可用区域列表（含边界坐标，用于前端估算瓦片数）"""
     return jsonify({
-        "regions": list(downloader.regions.keys())
+        "regions": [
+            {"name": name, "bounds": data["bounds"]}
+            for name, data in downloader.regions.items()
+        ]
     })
 
 @app.route('/api/download/start', methods=['POST'])

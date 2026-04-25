@@ -82,37 +82,15 @@
       </div>
     </div>
 
-    <!-- 底部：统一的 Mac 风格系统终端 -->
-    <div class="terminal-container">
-      <div class="terminal-header">
-        <div class="mac-buttons">
-          <span class="mac-btn close"></span>
-          <span class="mac-btn minimize"></span>
-          <span class="mac-btn expand"></span>
-        </div>
-        <div class="terminal-title">viewer.log - 渲染追踪日志</div>
-        <button @click="clearLogs" class="btn-clear-log">CLEAR</button>
-      </div>
-      <div class="terminal-body" ref="logContent">
-        <div v-if="logs.length === 0" class="terminal-empty">
-          ~ $ Waiting for rendering engine...
-        </div>
-        <div v-for="(log, index) in logs" :key="index" class="log-line" :class="'log-' + log.type">
-          <span class="log-time">{{ log.time }}</span>
-          <span class="log-divider">|</span>
-          <span class="log-message">{{ log.message }}</span>
-        </div>
-      </div>
-    </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted, computed, nextTick } from 'vue';
-
-const BACKEND_URL = 'http://localhost:5000';
-const LOCAL_TILE_URL = `${BACKEND_URL}/map_tiles/{z}/{x}/{y}.png`;
-const ONLINE_TILE_URL = 'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import { useLog } from '../composables/useLog.js';
+import { api, LOCAL_TILE_URL, ONLINE_TILE_URL } from '../services/api.js';
 
 const mapContainer = ref(null);
 const logContent = ref(null);
@@ -122,11 +100,11 @@ const isBackendOnline = ref(false);
 const tileSource = ref('local');
 const currentPosition = ref('Initializing...');
 const currentZoom = ref(0);
-const loadStatus = ref('idle'); 
-const logs = ref([]);
+const loadStatus = ref('idle');
 
-let L = null; 
-let resizeObserver = null; // 用于监听容器大小变化
+const { logs, addLog, clearLogs } = useLog(logContent);
+
+let resizeObserver = null;
 
 const quickLocations = [
   { name: '东京区', center:[35.6895, 139.6917], zoom: 13 },
@@ -147,26 +125,12 @@ const loadStatusText = computed(() => {
   return texts[loadStatus.value] || 'Unknown';
 });
 
-const addLog = (message, type = 'info') => {
-  const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  logs.value.push({ time, message, type });
-  if (logs.value.length > 100) logs.value.shift();
-  nextTick(() => {
-    if (logContent.value) logContent.value.scrollTop = logContent.value.scrollHeight;
-  });
-};
-
-const clearLogs = () => {
-  logs.value =[];
-  addLog('Terminal buffer cleared.', 'info');
-};
-
 const testBackend = async () => {
   addLog('Ping 后端网关接口...', 'warning');
   try {
-    await new Promise(resolve => setTimeout(resolve, 600)); // 模拟延迟
+    const ms = await api.ping();
     isBackendOnline.value = true;
-    addLog('节点探测成功 (200 OK), 延迟: 12ms', 'success');
+    addLog(`节点探测成功 (200 OK), 延迟: ${ms}ms`, 'success');
   } catch (error) {
     isBackendOnline.value = false;
     addLog(`网关拒绝连接: ${error.message}`, 'error');
@@ -182,7 +146,7 @@ const createCustomTileLayer = () => {
     addLog('路由切换：强制本地节点模式', 'info');
     return L.tileLayer(LOCAL_TILE_URL, { attribution: 'Tiles &copy; Local Cache', maxZoom: 17, minZoom: 2 });
   }
-  
+
   addLog('路由切换：智能混合 (Local-First Fallback)', 'info');
   const SmartTileLayer = L.TileLayer.extend({
     createTile: function(coords, done) {
@@ -196,7 +160,7 @@ const createCustomTileLayer = () => {
         if (!triedOnline) {
           triedOnline = true;
           addLog(`Cache Miss[Z${coords.z} / X${coords.x} / Y${coords.y}] -> 正在回源`, 'warning');
-          tile.src = onlineUrl; 
+          tile.src = onlineUrl;
         } else {
           done(new Error('Tile failed'), tile);
           loadStatus.value = 'error';
@@ -219,25 +183,24 @@ const switchTileSource = () => {
 };
 
 const updateMapInfo = () => {
-  if(!mapInstance.value) return;
+  if (!mapInstance.value) return;
   const center = mapInstance.value.getCenter();
   currentPosition.value = `${center.lat.toFixed(4)}, ${center.lng.toFixed(4)}`;
   currentZoom.value = mapInstance.value.getZoom();
 };
 
 const initMap = () => {
-  if (!L) return addLog('Leaflet Core 加载失败', 'error');
   addLog('初始化地图渲染引擎...', 'info');
-  
-  const map = L.map('local-leaflet-map', { zoomControl: false }).setView([36.2048, 138.2529], 5); 
+
+  const map = L.map('local-leaflet-map', { zoomControl: false }).setView([36.2048, 138.2529], 5);
   L.control.zoom({ position: 'bottomright' }).addTo(map);
   mapInstance.value = map;
   switchTileSource();
-  
+
   map.on('moveend', updateMapInfo);
   map.on('zoomend', () => { updateMapInfo(); addLog(`Viewport 缩放至 Level: Z-${map.getZoom()}`, 'info'); });
-  
-  // 使用 ResizeObserver 完美解决 Vue 中 KeepAlive 切换时尺寸塌陷问题
+
+  // ResizeObserver 解决 Vue KeepAlive 切换时 Leaflet 尺寸塌陷
   resizeObserver = new ResizeObserver(() => {
     map.invalidateSize();
   });
@@ -260,19 +223,8 @@ const resetView = () => {
 };
 
 onMounted(() => {
-  const css = document.createElement('link');
-  css.rel = 'stylesheet';
-  css.href = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';
-  document.head.appendChild(css);
-
-  const script = document.createElement('script');
-  script.src = 'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
-  script.onload = () => {
-    L = window.L;
-    initMap();
-    testBackend(); 
-  };
-  document.head.appendChild(script);
+  initMap();
+  testBackend();
 });
 
 onUnmounted(() => {
@@ -332,14 +284,18 @@ onUnmounted(() => {
   height: 8px;
   border-radius: 50%;
   background-color: #94a3b8;
+  flex-shrink: 0;
 }
 .status-badge.online .pulse-dot {
   background-color: #10b981;
-  box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.2);
+  animation: pulse-online 2s ease-in-out infinite;
 }
 .status-badge.offline .pulse-dot {
   background-color: #ef4444;
-  box-shadow: 0 0 0 3px rgba(239, 68, 68, 0.2);
+}
+@keyframes pulse-online {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.5); }
+  50%       { box-shadow: 0 0 0 5px rgba(16, 185, 129, 0); }
 }
 
 /* 表单控件 */
@@ -529,63 +485,4 @@ onUnmounted(() => {
 }
 .w-full { width: 100%; text-align: center; }
 
-/* 底部 Mac 终端日志 (复用下载器样式) */
-.terminal-container {
-  height: 220px;
-  background: #0f172a;
-  border-top: 1px solid #1e293b;
-  display: flex;
-  flex-direction: column;
-}
-.terminal-header {
-  background: #1e293b;
-  padding: 0.5rem 1rem;
-  display: flex;
-  align-items: center;
-}
-.mac-buttons {
-  display: flex;
-  gap: 6px;
-  margin-right: 1rem;
-}
-.mac-btn { width: 12px; height: 12px; border-radius: 50%; }
-.mac-btn.close { background: #ef4444; }
-.mac-btn.minimize { background: #f59e0b; }
-.mac-btn.expand { background: #10b981; }
-.terminal-title {
-  flex: 1;
-  color: #94a3b8;
-  font-size: 0.75rem;
-  font-family: monospace;
-}
-.btn-clear-log {
-  background: none;
-  border: 1px solid #475569;
-  color: #94a3b8;
-  font-size: 0.7rem;
-  padding: 0.15rem 0.5rem;
-  border-radius: 4px;
-  cursor: pointer;
-}
-.btn-clear-log:hover { color: #f8fafc; border-color: #64748b; }
-
-.terminal-body {
-  flex: 1;
-  padding: 0.75rem 1rem;
-  overflow-y: auto;
-  font-family: 'Fira Code', 'Courier New', monospace;
-  font-size: 0.85rem;
-  line-height: 1.6;
-}
-.terminal-body::-webkit-scrollbar { width: 8px; }
-.terminal-body::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-.terminal-empty { color: #475569; }
-.log-line { display: flex; align-items: flex-start; margin-bottom: 0.25rem; word-break: break-all; }
-.log-time { color: #64748b; white-space: nowrap; }
-.log-divider { color: #334155; margin: 0 0.5rem; }
-.log-message { flex: 1; }
-.log-info .log-message { color: #e2e8f0; }
-.log-success .log-message { color: #34d399; }
-.log-error .log-message { color: #f87171; }
-.log-warning .log-message { color: #fbbf24; }
 </style>
