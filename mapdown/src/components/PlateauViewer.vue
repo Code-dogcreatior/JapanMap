@@ -122,6 +122,11 @@
       <div class="ctrl-btns">
         <button class="ctrl-btn" @click="resetView" :disabled="!currentDataset || !!busy">↺ 重置视角</button>
         <button class="ctrl-btn" @click="toggleScene">⊞ {{ is3D ? '切换2D' : '切换3D' }}</button>
+        <button
+          class="ctrl-btn ctrl-btn-wide"
+          :class="{ active: viewControlMode }"
+          @click="toggleViewControlMode"
+        >⌁ 视角模式 {{ viewControlMode ? '开' : '关' }}</button>
       </div>
 
       <!-- 已加载信息 -->
@@ -156,7 +161,7 @@
         <b>{{ mountedTilesets.size }} / {{ MAX_MOUNTED }}</b>
       </div>
 
-      <div class="tip-box">鼠标左键旋转 · 右键平移 · 滚轮缩放</div>
+      <div class="tip-box">鼠标左键旋转 · 右键平移 · 双指缩放 · 视角模式/Shift/Option+双指调角度</div>
     </aside>
 
     <!-- 右上角标志 -->
@@ -231,25 +236,32 @@ const currentDataset = ref(null)
 const busy = ref(null)
 const errMsg = ref(null)
 const is3D = ref(true)
+const viewControlMode = ref(false)
 const snapDiagnostic = ref(null)
 let currentTileset = null
 
 // 下载/本地缓存
 const localSet = ref(new Set())                // dataset_id 集合：本地已下载
 const downloadStatus = ref({})                 // dataset_id -> {status,files,bytes,errors,...}
-const autoDownload = ref(true)                 // 切换：加载即下载
-const autoMount = ref(true)                    // 切换：视口内自动挂载多个 tileset
+const autoDownload = ref(false)                // 切换：加载即下载；默认关，避免误拉大体积 PLATEAU 数据
+const autoMount = ref(false)                   // 切换：视口内自动挂载多个 tileset；默认关，避免相机移动触发大量远程加载
 const terrainEnabled = ref(false)              // 真实地形是否就绪（异步加载）
 let statusPollTimer = null
 
 // 视口多挂载：dataset_id -> {tileset, dataset, mountedAt}
 // 使用 reactive Map 让模板的 .size/.has 响应；tileset 对象用 markRaw 防止 Vue 深度跟踪
 const mountedTilesets = reactive(new Map())
-const MAX_MOUNTED = 12                         // 同时挂载上限（避免 GPU 爆显存）
+const MAX_MOUNTED = 4                          // 同时挂载上限（避免 GPU 爆显存/网络被远程 tileset 打满）
 const BUILDING_HEIGHT_OFFSET_METERS = -0.5     // 自动贴合 DEM 后的微调；负数略微压入地面
 const ESTIMATED_BUILDING_BASE_BELOW_CENTER_METERS = 35
 const MAX_BUILDING_SNAP_OFFSET_METERS = 120    // 防止异常 DEM/boundingVolume 把模型移动到视野外
+const TERRAIN_RENDER_MAX_LEVEL = 12            // 地形渲染用较低级别，贴地采样仍会单独取高精度 DEM
+const DEM_SNAP_MAX_LEVEL = 14
+const DEM_SNAP_MIN_LEVEL = 8
 const tilesetCenterCache = new Map()           // dataset_id -> {lon,lat} （已加载过的中心）
+const tilesetBoundsCache = new Map()           // dataset_id -> {west,south,east,north}，用于近距离视口稳定挂载
+const demPixelCache = new Map()                // "z/x/y/px/py" -> {height,source} | null
+let removeTrackpadZoomListeners = null
 
 // -------- Computed --------
 const prefList = computed(() => {
@@ -401,6 +413,186 @@ function createLocalMapImageryProvider() {
   })
 }
 
+function createOnlineMapImageryProvider() {
+  return new Cesium.UrlTemplateImageryProvider({
+    url: 'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+    minimumLevel: 2,
+    maximumLevel: 18,
+    credit: 'Tiles: GSI Japan',
+  })
+}
+
+function currentCameraHeight() {
+  if (!viewer.value) return 1000
+  const camera = viewer.value.camera
+  const ellipsoid = viewer.value.scene.globe.ellipsoid
+  const carto = ellipsoid.cartesianToCartographic(camera.positionWC || camera.position)
+  return Math.max(carto?.height || 1000, 1)
+}
+
+function applyTrackpadZoom(scaleDelta) {
+  if (!viewer.value || !Number.isFinite(scaleDelta) || scaleDelta === 1) return
+  const camera = viewer.value.camera
+  const clampedScale = Cesium.Math.clamp(scaleDelta, 0.88, 1.14)
+  const height = currentCameraHeight()
+  const amount = Cesium.Math.clamp(
+    height * Math.abs(clampedScale - 1) * 1.45,
+    8,
+    Math.max(20, height * 0.38)
+  )
+  if (clampedScale > 1) {
+    camera.zoomIn(amount)
+  } else {
+    camera.zoomOut(amount)
+  }
+  viewer.value.scene.requestRender()
+}
+
+function applyTrackpadHeading(deltaDegrees) {
+  if (!viewer.value || !Number.isFinite(deltaDegrees)) return
+  const camera = viewer.value.camera
+  const angle = Cesium.Math.clamp(Cesium.Math.toRadians(deltaDegrees) * 0.18, -0.018, 0.018)
+  camera.setView({
+    orientation: {
+      heading: camera.heading + angle,
+      pitch: camera.pitch,
+      roll: 0,
+    },
+  })
+  viewer.value.scene.requestRender()
+}
+
+function applyTrackpadTilt(deltaPixels) {
+  if (!viewer.value || !Number.isFinite(deltaPixels)) return
+  const camera = viewer.value.camera
+  const delta = Cesium.Math.clamp(deltaPixels * 0.00045, -0.014, 0.014)
+  const pitch = Cesium.Math.clamp(
+    camera.pitch - delta,
+    Cesium.Math.toRadians(-88),
+    Cesium.Math.toRadians(-6)
+  )
+  camera.setView({
+    orientation: {
+      heading: camera.heading,
+      pitch,
+      roll: 0,
+    },
+  })
+  viewer.value.scene.requestRender()
+}
+
+function normalizeWheelDelta(event) {
+  const unit = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? 100 : 1
+  return {
+    x: (event.deltaX || 0) * unit,
+    y: (event.deltaY || 0) * unit,
+  }
+}
+
+function isSidePanelEvent(event) {
+  const path = typeof event.composedPath === 'function' ? event.composedPath() : []
+  return path.some(el => el?.classList?.contains?.('side-panel'))
+}
+
+function installTrackpadZoom(containerEl) {
+  if (!containerEl) return () => {}
+  let lastGestureScale = 1
+  let lastGestureRotation = 0
+  let pointerInScene = false
+
+  const onGestureStart = (event) => {
+    lastGestureScale = event.scale || 1
+    lastGestureRotation = event.rotation || 0
+    event.preventDefault()
+  }
+
+  const onGestureChange = (event) => {
+    const nextScale = event.scale || 1
+    const scaleDelta = nextScale / (lastGestureScale || 1)
+    lastGestureScale = nextScale
+    applyTrackpadZoom(scaleDelta)
+
+    const nextRotation = event.rotation || 0
+    const rotationDelta = nextRotation - lastGestureRotation
+    lastGestureRotation = nextRotation
+    if (Math.abs(rotationDelta) > 0.05) applyTrackpadHeading(rotationDelta)
+
+    event.preventDefault()
+  }
+
+  const onGestureEnd = (event) => {
+    lastGestureScale = 1
+    lastGestureRotation = 0
+    event.preventDefault()
+  }
+
+  const stopCesiumWheel = (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation()
+  }
+
+  const onWheel = (event) => {
+    const eventTarget = event.target
+    const fromScene = pointerInScene || eventTarget === containerEl || containerEl.contains(eventTarget)
+    if (!fromScene || isSidePanelEvent(event)) return
+
+    const { x, y } = normalizeWheelDelta(event)
+
+    if (event.ctrlKey) {
+      const scaleDelta = Math.exp(-y * 0.004)
+      applyTrackpadZoom(scaleDelta)
+      stopCesiumWheel(event)
+      return
+    }
+
+    if (viewControlMode.value || event.shiftKey || event.altKey) {
+      if (viewControlMode.value) {
+        if (Math.abs(x) > 0.1) applyTrackpadHeading(x * 0.018)
+        if (Math.abs(y) > 0.1) applyTrackpadTilt(y)
+      } else if (event.altKey) {
+        const headingSource = Math.abs(x) > 0.1 ? x : y
+        if (Math.abs(headingSource) > 0.1) applyTrackpadHeading(headingSource * 0.018)
+      } else {
+        const headingSource = Math.abs(x) > 0.1 ? x : y
+        if (Math.abs(headingSource) > 0.1) applyTrackpadHeading(headingSource * 0.018)
+      }
+      stopCesiumWheel(event)
+    }
+  }
+
+  const onPointerEnter = () => { pointerInScene = true }
+  const onPointerLeave = () => { pointerInScene = false }
+
+  containerEl.addEventListener('gesturestart', onGestureStart, { passive: false })
+  containerEl.addEventListener('gesturechange', onGestureChange, { passive: false })
+  containerEl.addEventListener('gestureend', onGestureEnd, { passive: false })
+  containerEl.addEventListener('pointerenter', onPointerEnter)
+  containerEl.addEventListener('pointerleave', onPointerLeave)
+  containerEl.addEventListener('mouseenter', onPointerEnter)
+  containerEl.addEventListener('mouseleave', onPointerLeave)
+  containerEl.addEventListener('wheel', onWheel, { passive: false, capture: true })
+  viewer.value?.canvas?.addEventListener('wheel', onWheel, { passive: false, capture: true })
+  window.addEventListener('wheel', onWheel, { passive: false, capture: true })
+
+  return () => {
+    containerEl.removeEventListener('gesturestart', onGestureStart)
+    containerEl.removeEventListener('gesturechange', onGestureChange)
+    containerEl.removeEventListener('gestureend', onGestureEnd)
+    containerEl.removeEventListener('pointerenter', onPointerEnter)
+    containerEl.removeEventListener('pointerleave', onPointerLeave)
+    containerEl.removeEventListener('mouseenter', onPointerEnter)
+    containerEl.removeEventListener('mouseleave', onPointerLeave)
+    containerEl.removeEventListener('wheel', onWheel, { capture: true })
+    viewer.value?.canvas?.removeEventListener('wheel', onWheel, { capture: true })
+    window.removeEventListener('wheel', onWheel, { capture: true })
+  }
+}
+
+function toggleViewControlMode() {
+  viewControlMode.value = !viewControlMode.value
+}
+
 onMounted(async () => {
   const creditEl = document.createElement('div')
   creditEl.style.cssText = 'position:absolute;font-size:0;opacity:0;pointer-events:none;'
@@ -408,7 +600,7 @@ onMounted(async () => {
 
   const v = new Cesium.Viewer(container.value, {
     baseLayer: new Cesium.ImageryLayer(
-      createLocalMapImageryProvider()
+      createOnlineMapImageryProvider()
     ),
     terrainProvider: new Cesium.EllipsoidTerrainProvider(),
     baseLayerPicker: false,
@@ -422,8 +614,15 @@ onMounted(async () => {
     infoBox: false,
     creditContainer: creditEl,
   })
+  v.imageryLayers.addImageryProvider(createLocalMapImageryProvider())
   v.scene.globe.depthTestAgainstTerrain = true
-  v.scene.globe.maximumScreenSpaceError = 1.5
+  v.scene.globe.maximumScreenSpaceError = 3
+  v.scene.screenSpaceCameraController.inertiaSpin = 0.35
+  v.scene.screenSpaceCameraController.inertiaTranslate = 0.35
+  v.scene.screenSpaceCameraController.inertiaZoom = 0.28
+  v.scene.fog.enabled = true
+  v.scene.fog.density = 0.00018
+  v.scene.requestRenderMode = false
 
   v.camera.setView({
     destination: Cesium.Cartesian3.fromDegrees(139.7671, 35.6812, 18000),
@@ -435,6 +634,7 @@ onMounted(async () => {
   })
 
   viewer.value = v
+  removeTrackpadZoomListeners = installTrackpadZoom(container.value)
   fetchCatalog()
   refreshLocal()
   refreshStatus()
@@ -457,6 +657,10 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  if (removeTrackpadZoomListeners) {
+    removeTrackpadZoomListeners()
+    removeTrackpadZoomListeners = null
+  }
   stopPolling()
   // 卸载所有挂载中的 tileset
   for (const { tileset } of mountedTilesets.values()) {
@@ -517,6 +721,7 @@ function createGsiDemTerrainProvider() {
   const errorEvent = new Cesium.Event()
   const credit = new Cesium.Credit('国土地理院 DEM')
   const flatBuffer16x16 = new Float32Array(16 * 16)
+  const geometryCache = new Map()
 
   return {
     tilingScheme,
@@ -536,25 +741,31 @@ function createGsiDemTerrainProvider() {
 
     getTileDataAvailable(x, y, level) {
       // GSI DEM 大致到 14 级；低级别也存在但可能是黑底
-      return level <= 14
+      return level <= TERRAIN_RENDER_MAX_LEVEL
     },
 
     loadTileDataAvailability() { return undefined },
 
     async requestTileGeometry(x, y, level) {
       // 太低/太高级别直接返平：避免无谓请求
-      if (level < 4 || level > 14) {
+      if (level < 4 || level > TERRAIN_RENDER_MAX_LEVEL) {
         return new Cesium.HeightmapTerrainData({
           buffer: flatBuffer16x16, width: 16, height: 16, childTileMask: 15,
         })
       }
-      const url = `/gsi-dem-local/${level}/${x}/${y}.png`
+      const cacheKey = `${level}/${x}/${y}`
+      const cached = geometryCache.get(cacheKey)
+      if (cached) return cached
+      const url = `/gsi-dem/${level}/${x}/${y}.png`
       try {
         const img = await loadImageAnon(url)
         const heights = decodeGsiDemPng(img)
-        return new Cesium.HeightmapTerrainData({
+        const data = new Cesium.HeightmapTerrainData({
           buffer: heights, width: 256, height: 256, childTileMask: 15,
         })
+        if (geometryCache.size > 512) geometryCache.clear()
+        geometryCache.set(cacheKey, data)
+        return data
       } catch (_) {
         // 海上 / 日本以外：返回全 0
         return new Cesium.HeightmapTerrainData({
@@ -626,17 +837,63 @@ function decodeGsiDemPixel(img, px, py) {
 }
 
 async function sampleLocalDemPixel(longitude, latitude) {
-  for (let level = 14; level >= 8; level--) {
+  for (let level = DEM_SNAP_MAX_LEVEL; level >= DEM_SNAP_MIN_LEVEL; level--) {
     const { x, y, px, py } = lonLatToTilePixel(longitude, latitude, level)
+    const key = `${level}/${x}/${y}/${px}/${py}`
+    if (demPixelCache.has(key)) return demPixelCache.get(key)
     try {
-      const img = await loadImageAnon(`/gsi-dem-local/${level}/${x}/${y}.png`)
+      const img = await loadImageAnon(`/gsi-dem/${level}/${x}/${y}.png`)
       const h = decodeGsiDemPixel(img, px, py)
       if (Number.isFinite(h)) {
-        return { height: h, source: `DEM Z${level} ${x}/${y} (${px},${py})` }
+        const result = { height: h, source: `DEM Z${level} ${x}/${y} (${px},${py})` }
+        if (demPixelCache.size > 800) demPixelCache.clear()
+        demPixelCache.set(key, result)
+        return result
       }
+      demPixelCache.set(key, null)
     } catch (_) {}
   }
   return null
+}
+
+function offsetLonLat(longitude, latitude, eastMeters, northMeters) {
+  const earthRadius = 6378137
+  const lat = latitude + northMeters / earthRadius
+  const lon = longitude + eastMeters / (earthRadius * Math.max(Math.cos(latitude), 0.25))
+  return { longitude: lon, latitude: lat }
+}
+
+async function sampleDemPatch(longitude, latitude, radiusMeters) {
+  const radius = Cesium.Math.clamp((radiusMeters || 120) * 0.18, 25, 120)
+  const offsets = [
+    [0, 0],
+    [radius, 0],
+    [-radius, 0],
+    [0, radius],
+    [0, -radius],
+    [radius * 0.7, radius * 0.7],
+    [-radius * 0.7, radius * 0.7],
+    [radius * 0.7, -radius * 0.7],
+    [-radius * 0.7, -radius * 0.7],
+  ]
+  const samples = []
+  let centerHeight = null
+  for (const [east, north] of offsets) {
+    const p = offsetLonLat(longitude, latitude, east, north)
+    const dem = await sampleLocalDemPixel(p.longitude, p.latitude)
+    if (dem && Number.isFinite(dem.height)) {
+      if (east === 0 && north === 0) centerHeight = dem.height
+      samples.push(dem.height)
+    }
+  }
+  if (!samples.length) return null
+  const sorted = samples.slice().sort((a, b) => a - b)
+  const medianHeight = sorted[Math.floor(sorted.length / 2)]
+  const terrainHeight = Number.isFinite(centerHeight) ? (centerHeight * 0.65 + medianHeight * 0.35) : medianHeight
+  return {
+    height: terrainHeight,
+    source: `DEM patch median (${samples.length} samples, center ${(centerHeight ?? terrainHeight).toFixed(2)} m)`,
+  }
 }
 
 async function sampleRenderedTerrain(longitude, latitude) {
@@ -667,6 +924,24 @@ function applyVerticalOffset(tileset, longitude, latitude, offsetMeters) {
   tileset.modelMatrix = Cesium.Matrix4.fromTranslation(translation)
 }
 
+function tuneTilesetForStableView(tileset, { auto = false } = {}) {
+  if (!tileset) return
+  tileset.show = true
+  tileset.maximumScreenSpaceError = auto ? 16 : 10
+  tileset.skipLevelOfDetail = false
+  tileset.cullRequestsWhileMoving = false
+  tileset.cullRequestsWhileMovingMultiplier = 0
+  tileset.preloadWhenHidden = false
+  tileset.preloadFlightDestinations = false
+  tileset.dynamicScreenSpaceError = true
+  tileset.dynamicScreenSpaceErrorDensity = 0.0018
+  tileset.dynamicScreenSpaceErrorFactor = auto ? 10 : 6
+  tileset.cacheBytes = auto ? 96 * 1024 * 1024 : 160 * 1024 * 1024
+  tileset.maximumCacheOverflowBytes = auto ? 48 * 1024 * 1024 : 96 * 1024 * 1024
+  tileset.immediatelyLoadDesiredLevelOfDetail = false
+  tileset.loadSiblings = false
+}
+
 function clampSnapOffset(offsetMeters) {
   if (!Number.isFinite(offsetMeters)) return 0
   return Cesium.Math.clamp(
@@ -689,7 +964,11 @@ async function dropTilesetToGround(tileset, options = {}) {
     if (!tileset.root || !tileset.boundingSphere) return
     const carto = Cesium.Cartographic.fromCartesian(tileset.boundingSphere.center)
     const tilesetMinHeight = getTilesetMinimumHeight(tileset)
-    const terrain = await sampleRenderedTerrain(carto.longitude, carto.latitude)
+    const terrain = await sampleDemPatch(
+      carto.longitude,
+      carto.latitude,
+      tileset.boundingSphere.radius
+    ) || await sampleRenderedTerrain(carto.longitude, carto.latitude)
     const rawOffset = terrain.height - tilesetMinHeight + BUILDING_HEIGHT_OFFSET_METERS
     const offset = clampSnapOffset(rawOffset)
     applyVerticalOffset(tileset, carto.longitude, carto.latitude, offset)
@@ -755,7 +1034,7 @@ async function loadDataset(dataset) {
   try {
     const url = effectiveUrl(dataset)
     tileset = await Cesium.Cesium3DTileset.fromUrl(url)
-    tileset.maximumScreenSpaceError = 8
+    tuneTilesetForStableView(tileset)
     viewer.value.scene.primitives.add(tileset)
     await dropTilesetToGround(tileset, { recordDiagnostic: true })
     cacheTilesetCenter(dataset.id, tileset)
@@ -788,9 +1067,18 @@ function resetView() {
 function cacheTilesetCenter(id, tileset) {
   if (!tileset.boundingSphere) return
   const c = Cesium.Cartographic.fromCartesian(tileset.boundingSphere.center)
+  const earthRadius = viewer.value?.scene.globe.ellipsoid.maximumRadius || 6378137
+  const latBuffer = Cesium.Math.toDegrees(tileset.boundingSphere.radius / earthRadius)
+  const lonBuffer = latBuffer / Math.max(Math.cos(c.latitude), 0.25)
   tilesetCenterCache.set(id, {
     lon: Cesium.Math.toDegrees(c.longitude),
     lat: Cesium.Math.toDegrees(c.latitude),
+  })
+  tilesetBoundsCache.set(id, {
+    west: Cesium.Math.toDegrees(c.longitude) - lonBuffer,
+    south: Cesium.Math.toDegrees(c.latitude) - latBuffer,
+    east: Cesium.Math.toDegrees(c.longitude) + lonBuffer,
+    north: Cesium.Math.toDegrees(c.latitude) + latBuffer,
   })
 }
 
@@ -816,6 +1104,18 @@ function datasetPoint(dataset) {
   return p ? { lon: p[0], lat: p[1] } : null
 }
 
+function rectIntersects(a, b) {
+  return a.west <= b.east && a.east >= b.west && a.south <= b.north && a.north >= b.south
+}
+
+function datasetIntersectsViewport(dataset, bounds) {
+  const rect = tilesetBoundsCache.get(dataset.id)
+  if (rect) return rectIntersects(rect, bounds)
+  const p = datasetPoint(dataset)
+  return !!p && p.lon >= bounds.west && p.lon <= bounds.east &&
+    p.lat >= bounds.south && p.lat <= bounds.north
+}
+
 // 视口自动挂载逻辑（相机停下时调用，加节流）
 let autoMountTimer = null
 function scheduleAutoMount() {
@@ -835,13 +1135,9 @@ async function runAutoMount() {
   // 候选：当前筛选范围内 + 代表点落在视口
   const candidates = []
   for (const d of visibleDatasets.value) {
-    const p = datasetPoint(d)
-    if (!p) continue
-    if (p.lon >= bounds.west && p.lon <= bounds.east &&
-        p.lat >= bounds.south && p.lat <= bounds.north) {
-      candidates.push(d)
-    }
+    if (datasetIntersectsViewport(d, bounds)) candidates.push(d)
   }
+  if (candidates.length === 0 && mountedTilesets.size > 0 && currentCameraHeight() < 2500) return
 
   // 按 LOD 优先级，每个 city_code+ward_code 只取一个
   const byKey = new Map()
@@ -853,18 +1149,10 @@ async function runAutoMount() {
     if (!cur || lodWeight(d.lod) > lodWeight(cur.lod)) byKey.set(k, d)
   }
   const targets = Array.from(byKey.values()).slice(0, MAX_MOUNTED)
-  const targetIds = new Set(targets.map(d => d.id))
 
-  // 卸载：当前挂着但不在 targets 里的
-  for (const [id, { tileset }] of mountedTilesets.entries()) {
-    if (!targetIds.has(id)) {
-      try { viewer.value.scene.primitives.remove(tileset) } catch (_) {}
-      mountedTilesets.delete(id)
-    }
-  }
-
-  // 挂载：targets 里但还没挂的
+  // 挂载：只补新目标，不按视口结果自动卸载；倾斜视角下 computeViewRectangle 不稳定，自动卸载会造成建筑闪消。
   for (const d of targets) {
+    if (mountedTilesets.size >= MAX_MOUNTED) break
     if (mountedTilesets.has(d.id)) continue
     mountTileset(d)  // 不 await，并发挂
   }
@@ -876,7 +1164,7 @@ async function mountTileset(dataset) {
   try {
     const url = effectiveUrl(dataset)
     const tileset = await Cesium.Cesium3DTileset.fromUrl(url)
-    tileset.maximumScreenSpaceError = 12  // 多挂时给宽松点，省 GPU
+    tuneTilesetForStableView(tileset, { auto: true })
     viewer.value.scene.primitives.add(tileset)
     await dropTilesetToGround(tileset)
     cacheTilesetCenter(dataset.id, tileset)
@@ -912,6 +1200,7 @@ function toggleScene() {
   inset: 0;
   width: 100%;
   height: 100%;
+  touch-action: none;
 }
 
 /* ---- 侧面板 ---- */

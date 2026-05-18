@@ -71,10 +71,18 @@
               </svg>
               部署下载任务
             </button>
-            <button v-else class="btn btn-downloading btn-block" disabled>
-              <span class="spinner"></span>
-              引擎采集中...
-            </button>
+            <div v-else class="running-actions">
+              <button class="btn btn-downloading btn-block" disabled>
+                <span class="spinner"></span>
+                引擎采集中...
+              </button>
+              <button @click="stopDownload" class="btn btn-stop btn-block" :disabled="isStoppingDownload">
+                <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9A2.25 2.25 0 0118.75 7.5v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z" />
+                </svg>
+                {{ isStoppingDownload ? '停止请求已发送' : '停止下载任务' }}
+              </button>
+            </div>
 
             <button v-if="!isDemDownloading" @click="startDemDownload" class="btn btn-terrain btn-block" :disabled="!canStartDemDownload">
               <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
@@ -82,10 +90,18 @@
               </svg>
               下载 DEM 高度图
             </button>
-            <button v-else class="btn btn-downloading btn-block" disabled>
-              <span class="spinner"></span>
-              DEM 采集中...
-            </button>
+            <div v-else class="running-actions">
+              <button class="btn btn-downloading btn-block" disabled>
+                <span class="spinner"></span>
+                DEM 采集中...
+              </button>
+              <button @click="stopDemDownload" class="btn btn-stop btn-block" :disabled="isStoppingDemDownload">
+                <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M5.25 7.5A2.25 2.25 0 017.5 5.25h9A2.25 2.25 0 0118.75 7.5v9a2.25 2.25 0 01-2.25 2.25h-9a2.25 2.25 0 01-2.25-2.25v-9z" />
+                </svg>
+                {{ isStoppingDemDownload ? '停止请求已发送' : '停止 DEM 下载' }}
+              </button>
+            </div>
           </div>
 
           <!-- 进度模块 -->
@@ -246,6 +262,7 @@ const config = ref({
 
 const downloadStatus = ref({
   is_downloading: false,
+  stop_requested: false,
   progress: 0,
   total: 0,
   current: 0,
@@ -258,6 +275,7 @@ const downloadStatus = ref({
 
 const demDownloadStatus = ref({
   is_downloading: false,
+  stop_requested: false,
   progress: 0,
   total: 0,
   current: 0,
@@ -282,6 +300,8 @@ const demStats = ref({
 
 const logContainer = ref(null);
 const { logs, addLog: addLocalLog } = useLog(logContainer);
+const isStoppingDownload = ref(false);
+const isStoppingDemDownload = ref(false);
 
 const isDownloading = computed(() => downloadStatus.value.is_downloading);
 const isDemDownloading = computed(() => demDownloadStatus.value.is_downloading);
@@ -328,9 +348,22 @@ const startDownload = async () => {
     addLocalLog(`任务指令已下发，区域=${config.value.region}，调度中...`, 'success');
     lastHeartbeatTs = 0;
     lastProgressKey = '';
+    isStoppingDownload.value = false;
     startStatusPolling();
   } catch (error) {
     addLocalLog(`调度异常: ${error.message}`, 'error');
+  }
+};
+
+const stopDownload = async () => {
+  try {
+    isStoppingDownload.value = true;
+    await api.stopDownload();
+    addLocalLog('普通瓦片下载停止请求已发送，等待当前并发请求收尾...', 'warning');
+    startStatusPolling();
+  } catch (error) {
+    isStoppingDownload.value = false;
+    addLocalLog(`停止普通瓦片下载失败: ${error.message}`, 'error');
   }
 };
 
@@ -345,9 +378,22 @@ const startDemDownload = async () => {
     lastDemLogCount = 0;
     lastDemHeartbeatTs = 0;
     lastDemProgressKey = '';
+    isStoppingDemDownload.value = false;
     startDemStatusPolling();
   } catch (error) {
     addLocalLog(`DEM 调度异常: ${error.message}`, 'error');
+  }
+};
+
+const stopDemDownload = async () => {
+  try {
+    isStoppingDemDownload.value = true;
+    await api.stopDemDownload();
+    addLocalLog('DEM 下载停止请求已发送，等待当前并发请求收尾...', 'warning');
+    startDemStatusPolling();
+  } catch (error) {
+    isStoppingDemDownload.value = false;
+    addLocalLog(`停止 DEM 下载失败: ${error.message}`, 'error');
   }
 };
 
@@ -375,6 +421,7 @@ const loadStatus = async () => {
     }
 
     if (!data.is_downloading && statusInterval) {
+      isStoppingDownload.value = false;
       stopStatusPolling();
       loadStats();
     }
@@ -408,6 +455,7 @@ const loadDemStatus = async () => {
     }
 
     if (!data.is_downloading && demStatusInterval) {
+      isStoppingDemDownload.value = false;
       stopDemStatusPolling();
       loadDemStats();
     }
@@ -688,6 +736,24 @@ onUnmounted(() => {
   background: #f1f5f9;
   color: #4f46e5;
   border: 1px solid #c7d2fe;
+}
+.running-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+.btn-stop {
+  background: #fff1f2;
+  color: #be123c;
+  border: 1px solid #fecdd3;
+}
+.btn-stop:hover:not(:disabled) {
+  background: #ffe4e6;
+  transform: translateY(-1px);
+}
+.btn-stop:disabled {
+  opacity: 0.72;
+  cursor: wait;
 }
 .spinner {
   width: 16px; height: 16px;

@@ -15,11 +15,11 @@ set "EXTRA_FRONTEND_CMD=npm run dev"
 
 echo [1/3] Start Python backend map.py ...
 if exist "%PY_EXE%" (
-    start "map.py (Flask:5000)" cmd /k "cd /d ""%BASE_DIR%"" && ""%PY_EXE%"" map.py"
+    start "map.py (Flask:5001)" cmd /k "cd /d ""%BASE_DIR%"" && ""%PY_EXE%"" map.py"
 ) else (
     echo [WARN] PY_EXE not found: %PY_EXE%
     echo [WARN] Fallback to system python.
-    start "map.py (Flask:5000)" cmd /k "cd /d ""%BASE_DIR%"" && python map.py"
+    start "map.py (Flask:5001)" cmd /k "cd /d ""%BASE_DIR%"" && python map.py"
 )
 
 echo [2/3] Start mapdown frontend ...

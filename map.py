@@ -73,6 +73,7 @@ class JapanMapTileDownloader:
         # 下载状态追踪
         self.current_download = {
             "is_downloading": False,
+            "stop_requested": False,
             "progress": 0,
             "total": 0,
             "current": 0,
@@ -112,6 +113,9 @@ class JapanMapTileDownloader:
     async def download_single_tile_async(self, session, tile, semaphore, max_retries: int = 3, retry_delay: float = 1.0):
         """异步下载单个瓦片，带超时重试机制"""
         async with semaphore:  # 信号量控制并发数
+            if self.current_download.get("stop_requested"):
+                return "cancelled", "已停止"
+
             z, x, y = tile["z"], tile["x"], tile["y"]
             url = self.base_url.format(z=z, x=x, y=y)
             
@@ -125,6 +129,8 @@ class JapanMapTileDownloader:
             # 重试循环
             last_error = None
             for attempt in range(max_retries + 1):  # 总共尝试 max_retries + 1 次
+                if self.current_download.get("stop_requested"):
+                    return "cancelled", f"已停止: {z}/{x}/{y}"
                 try:
                     # 使用指数退避策略，每次重试前等待时间递增
                     if attempt > 0:
@@ -183,6 +189,7 @@ class JapanMapTileDownloader:
                                  max_concurrent: int = 400, max_retries: int = 3, retry_delay: float = 1.0):
         """异步下载方法，带状态追踪和超时重试机制"""
         self.current_download["is_downloading"] = True
+        self.current_download["stop_requested"] = False
         self.current_download["region"] = region
         self.current_download["logs"] = []
         
@@ -212,21 +219,26 @@ class JapanMapTileDownloader:
             timeout=timeout,
             headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         ) as session:
-            # 创建任务
-            tasks = []
-            for tile in tiles:
-                task = self.download_single_tile_async(session, tile, semaphore, max_retries, retry_delay)
-                tasks.append(task)
-            
-            # 并发执行并收集结果
-            results = []
-            for future in asyncio.as_completed(tasks):
+            pending = {
+                asyncio.create_task(self.download_single_tile_async(session, tile, semaphore, max_retries, retry_delay))
+                for tile in tiles
+            }
+            for future in asyncio.as_completed(pending):
                 result = await future
-                results.append(result)
                 
                 # 更新状态
                 status, message = result
-                if status == "skip" or status == "skip_404":
+                if status == "cancelled":
+                    with self._lock:
+                        self.current_download["total"] = self.current_download["current"]
+                        self.current_download["progress"] = 100
+                    self.add_log("⏹ 下载任务已停止", "warning")
+                    for task in pending:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    break
+                elif status == "skip" or status == "skip_404":
                     self.current_download["skip"] += 1
                 elif status == "success":
                     self.current_download["success"] += 1
@@ -248,9 +260,19 @@ class JapanMapTileDownloader:
                         "info"
                     )
         
-        self.add_log("✨ 下载完成!", "success")
-        self.generate_metadata(region, zoom_min, zoom_max, total)
+        if self.current_download.get("stop_requested"):
+            self.add_log("⏹ 下载已终止，已保存文件会保留", "warning")
+        else:
+            self.add_log("✨ 下载完成!", "success")
+            self.generate_metadata(region, zoom_min, zoom_max, total)
         self.current_download["is_downloading"] = False
+
+    def request_stop(self):
+        if self.current_download["is_downloading"]:
+            self.current_download["stop_requested"] = True
+            self.add_log("⏹ 已收到停止请求，正在收尾...", "warning")
+            return True
+        return False
     
     def download_tiles_api(self, region: str, zoom_min: int = 5, zoom_max: int = 8, 
                           max_workers: int = 100, max_retries: int = 3, retry_delay: float = 1.0):
@@ -323,6 +345,7 @@ class GsiDemDownloader:
         self._lock = threading.Lock()
         self.current_download = {
             "is_downloading": False,
+            "stop_requested": False,
             "progress": 0,
             "total": 0,
             "current": 0,
@@ -370,6 +393,9 @@ class GsiDemDownloader:
 
     async def download_single_tile_async(self, session, tile, semaphore, max_retries: int = 3, retry_delay: float = 1.0):
         async with semaphore:
+            if self.current_download.get("stop_requested"):
+                return "cancelled", "DEM 已停止"
+
             z, x, y = tile["z"], tile["x"], tile["y"]
             tile_path = self.output_dir / str(z) / str(x) / f"{y}.png"
             if tile_path.exists():
@@ -377,6 +403,8 @@ class GsiDemDownloader:
 
             url = self.base_url.format(z=z, x=x, y=y)
             for attempt in range(max_retries + 1):
+                if self.current_download.get("stop_requested"):
+                    return "cancelled", f"DEM 已停止: {z}/{x}/{y}"
                 try:
                     if attempt > 0:
                         await asyncio.sleep(retry_delay * (2 ** (attempt - 1)))
@@ -406,6 +434,7 @@ class GsiDemDownloader:
     async def download_tiles_async(self, region: str, zoom_min: int = 5, zoom_max: int = 12,
                                    max_concurrent: int = 120, max_retries: int = 3, retry_delay: float = 1.0):
         self.current_download["is_downloading"] = True
+        self.current_download["stop_requested"] = False
         self.current_download["region"] = region
         self.current_download["logs"] = []
 
@@ -434,13 +463,23 @@ class GsiDemDownloader:
                 timeout=timeout,
                 headers={'User-Agent': 'Mozilla/5.0 (GSI-DEM-downloader)'}
             ) as session:
-                tasks = [
-                    self.download_single_tile_async(session, tile, semaphore, max_retries, retry_delay)
+                pending = {
+                    asyncio.create_task(self.download_single_tile_async(session, tile, semaphore, max_retries, retry_delay))
                     for tile in tiles
-                ]
-                for future in asyncio.as_completed(tasks):
+                }
+                for future in asyncio.as_completed(pending):
                     status, message = await future
-                    if status in ("skip", "skip_404"):
+                    if status == "cancelled":
+                        with self._lock:
+                            self.current_download["total"] = self.current_download["current"]
+                            self.current_download["progress"] = 100
+                        self.add_log("⏹ DEM 下载任务已停止", "warning")
+                        for task in pending:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*pending, return_exceptions=True)
+                        break
+                    elif status in ("skip", "skip_404"):
                         self.current_download["skip"] += 1
                     elif status == "success":
                         self.current_download["success"] += 1
@@ -461,12 +500,22 @@ class GsiDemDownloader:
                             "info"
                         )
 
-            self.generate_metadata(region, zoom_min, zoom_max, total)
-            self.add_log("✨ DEM 下载完成!", "success")
+            if self.current_download.get("stop_requested"):
+                self.add_log("⏹ DEM 下载已终止，已保存文件会保留", "warning")
+            else:
+                self.generate_metadata(region, zoom_min, zoom_max, total)
+                self.add_log("✨ DEM 下载完成!", "success")
         except Exception as e:
             self.add_log(f"DEM 下载任务失败: {str(e)}", "error")
         finally:
             self.current_download["is_downloading"] = False
+
+    def request_stop(self):
+        if self.current_download["is_downloading"]:
+            self.current_download["stop_requested"] = True
+            self.add_log("⏹ 已收到 DEM 停止请求，正在收尾...", "warning")
+            return True
+        return False
 
     def download_tiles_api(self, region: str, zoom_min: int = 5, zoom_max: int = 12,
                            max_workers: int = 120, max_retries: int = 3, retry_delay: float = 1.0):
@@ -826,6 +875,13 @@ def get_status():
     """获取下载状态"""
     return jsonify(downloader.current_download)
 
+@app.route('/api/download/stop', methods=['POST'])
+def stop_download():
+    """请求停止当前普通瓦片下载任务"""
+    if downloader.request_stop():
+        return jsonify({"message": "停止请求已发送"})
+    return jsonify({"message": "当前没有进行中的下载任务", "not_running": True})
+
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """获取下载统计"""
@@ -867,6 +923,13 @@ def start_dem_download():
 def get_dem_status():
     """获取 DEM 下载状态"""
     return jsonify(dem_downloader.current_download)
+
+@app.route('/api/dem/download/stop', methods=['POST'])
+def stop_dem_download():
+    """请求停止当前 DEM 下载任务"""
+    if dem_downloader.request_stop():
+        return jsonify({"message": "DEM 停止请求已发送"})
+    return jsonify({"message": "当前没有进行中的 DEM 下载任务", "not_running": True})
 
 @app.route('/api/dem/stats', methods=['GET'])
 def get_dem_stats():
@@ -929,17 +992,49 @@ def serve_plateau(filename):
 # -------- GSI DEM 缓存代理 --------
 # 国土地理院 DEM 服务在中国不稳定（TLS 握手频繁失败），
 # 走 Flask 后端：本地有就直接返，没有就重试拉取并落盘。
-import base64
+import struct
 import urllib.request
 import urllib.error
+import zlib
 from flask import Response
 
 GSI_DEM_CACHE = dem_downloader.output_dir
 _dem_inflight = {}  # tile key -> threading.Event（避免同一瓦片并发重复拉取）
 _dem_inflight_lock = threading.Lock()
-_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
-)
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return (
+        struct.pack(">I", len(data))
+        + chunk_type
+        + data
+        + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+    )
+
+
+def _solid_png(width: int, height: int, channels: int, color: bytes) -> bytes:
+    """生成标准 8-bit PNG，用 256x256 占位图规避 Safari/WebGL 对 1x1/灰度 PNG 的兼容问题。"""
+    color_type = 6 if channels == 4 else 2
+    row = b"\x00" + color * width
+    raw = row * height
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(
+        b"IHDR",
+        struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0),
+    )
+    png += _png_chunk(b"IDAT", zlib.compress(raw, level=9))
+    png += _png_chunk(b"IEND", b"")
+    return png
+
+
+_TRANSPARENT_RGBA_PNG = _solid_png(256, 256, 4, b"\x00\x00\x00\x00")
+_GSI_DEM_NODATA_PNG = _solid_png(256, 256, 3, b"\x80\x00\x00")
+
+
+def _png_response(data: bytes, *, cache_seconds: int = 3600) -> Response:
+    resp = Response(data, mimetype='image/png')
+    resp.headers['Cache-Control'] = f'public, max-age={cache_seconds}'
+    return resp
 
 
 @app.route('/map_tiles_3d/<int:z>/<int:x>/<int:y>.png')
@@ -948,7 +1043,7 @@ def serve_tiles_3d(z, x, y):
     tile_path = downloader.output_dir / str(z) / str(x) / f"{y}.png"
     if tile_path.exists():
         return send_from_directory(downloader.output_dir, f"{z}/{x}/{y}.png")
-    return Response(_TRANSPARENT_PNG, mimetype='image/png')
+    return _png_response(_TRANSPARENT_RGBA_PNG)
 
 
 def _fetch_dem_tile(z, x, y, max_retries=3):
@@ -1003,25 +1098,25 @@ def _fetch_dem_tile(z, x, y, max_retries=3):
 
 @app.route('/gsi-dem/<int:z>/<int:x>/<int:y>.png')
 def serve_gsi_dem(z, x, y):
-    """GSI DEM 瓦片：本地缓存命中即返；否则重试拉取并缓存"""
+    """GSI DEM 瓦片：本地缓存命中即返；否则重试拉取并缓存，失败时返回 no-data PNG。"""
     if z > 14 or z < 0:
-        return Response('', status=404)
+        return _png_response(_GSI_DEM_NODATA_PNG)
     p = _fetch_dem_tile(z, x, y)
     if p is None or not p.exists():
-        return Response('', status=404)
+        return _png_response(_GSI_DEM_NODATA_PNG)
     return send_from_directory(GSI_DEM_CACHE, f"{z}/{x}/{y}.png")
 
 
 @app.route('/gsi-dem-local/<int:z>/<int:x>/<int:y>.png')
 def serve_gsi_dem_local(z, x, y):
-    """3D 场景专用 DEM：只读本地缓存，缺失立即 404，避免实时回源拖慢渲染。"""
+    """3D 场景专用 DEM：只读本地缓存，缺失时返回 GSI no-data PNG，避免 404 与 Safari 纹理异常。"""
     if z > 14 or z < 0:
-        return Response('', status=404)
+        return _png_response(_GSI_DEM_NODATA_PNG)
     p = GSI_DEM_CACHE / str(z) / str(x) / f"{y}.png"
     if not p.exists():
-        return Response('', status=404)
+        return _png_response(_GSI_DEM_NODATA_PNG)
     return send_from_directory(GSI_DEM_CACHE, f"{z}/{x}/{y}.png")
 
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+    app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)

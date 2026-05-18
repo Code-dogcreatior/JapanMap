@@ -22,10 +22,16 @@ export const api = {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
   }),
+  stopDownload: () => request('/download/stop', {
+    method: 'POST',
+  }),
   startDemDownload: (params) => request('/dem/download/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),
+  }),
+  stopDemDownload: () => request('/dem/download/stop', {
+    method: 'POST',
   }),
 
   async ping() {
