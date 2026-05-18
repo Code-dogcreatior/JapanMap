@@ -1,2 +1,4 @@
 # 忽略地图瓦片文件夹
 map_tiles/
+plateau_tiles/
+gsi_dem_cache/

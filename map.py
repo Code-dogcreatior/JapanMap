@@ -4,8 +4,10 @@ import math
 import json
 import asyncio
 import threading
+import copy
 from pathlib import Path
 from typing import List, Dict, Tuple
+from urllib.parse import urljoin, urlsplit
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 import aiohttp
@@ -306,6 +308,470 @@ class JapanMapTileDownloader:
 
 
 # ============================================
+# GSI DEM 下载器
+# ============================================
+
+class GsiDemDownloader:
+    """日本国土地理院 DEM PNG 瓦片下载器（与 map_tiles 使用同一 XYZ 网格）"""
+
+    def __init__(self, regions: Dict, output_dir: str = "./gsi_dem_cache"):
+        self.base_url = "https://cyberjapandata.gsi.go.jp/xyz/dem_png/{z}/{x}/{y}.png"
+        script_dir = Path(__file__).parent.absolute()
+        self.output_dir = script_dir / output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.regions = regions
+        self._lock = threading.Lock()
+        self.current_download = {
+            "is_downloading": False,
+            "progress": 0,
+            "total": 0,
+            "current": 0,
+            "success": 0,
+            "skip": 0,
+            "fail": 0,
+            "region": "",
+            "logs": []
+        }
+
+    def lat_lng_to_tile(self, lat: float, lng: float, zoom: int) -> Tuple[int, int]:
+        n = 2 ** zoom
+        x = int((lng + 180) / 360 * n)
+        lat_rad = math.radians(lat)
+        y = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+        return x, y
+
+    def generate_tile_list(self, region: str, zoom_min: int, zoom_max: int) -> List[Dict]:
+        if region not in self.regions:
+            raise ValueError(f"未知区域: {region}. 可选: {list(self.regions.keys())}")
+
+        zoom_min = max(0, min(14, int(zoom_min)))
+        zoom_max = max(0, min(14, int(zoom_max)))
+        if zoom_min > zoom_max:
+            raise ValueError("DEM zoom_min 不能大于 zoom_max")
+
+        bounds = self.regions[region]["bounds"]
+        tiles = []
+        for z in range(zoom_min, zoom_max + 1):
+            x_min, y_max = self.lat_lng_to_tile(bounds[0][0], bounds[0][1], z)
+            x_max, y_min = self.lat_lng_to_tile(bounds[1][0], bounds[1][1], z)
+            for x in range(x_min, x_max + 1):
+                for y in range(y_min, y_max + 1):
+                    tiles.append({"z": z, "x": x, "y": y})
+        return tiles
+
+    def add_log(self, message: str, log_type: str = "info"):
+        timestamp = time.strftime("%H:%M:%S")
+        with self._lock:
+            self.current_download["logs"].append({
+                "time": timestamp,
+                "message": message,
+                "type": log_type
+            })
+
+    async def download_single_tile_async(self, session, tile, semaphore, max_retries: int = 3, retry_delay: float = 1.0):
+        async with semaphore:
+            z, x, y = tile["z"], tile["x"], tile["y"]
+            tile_path = self.output_dir / str(z) / str(x) / f"{y}.png"
+            if tile_path.exists():
+                return "skip", f"已存在 DEM: {z}/{x}/{y}"
+
+            url = self.base_url.format(z=z, x=x, y=y)
+            for attempt in range(max_retries + 1):
+                try:
+                    if attempt > 0:
+                        await asyncio.sleep(retry_delay * (2 ** (attempt - 1)))
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                        if response.status == 404:
+                            return "skip_404", f"无 DEM: {z}/{x}/{y}"
+                        if response.status != 200:
+                            if attempt < max_retries:
+                                continue
+                            return "fail", f"DEM HTTP错误 {response.status}: {z}/{x}/{y}"
+
+                        content = await response.read()
+                        tile_path.parent.mkdir(parents=True, exist_ok=True)
+                        tile_path.write_bytes(content)
+                        return "success", f"成功 DEM: {z}/{x}/{y}"
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    if attempt < max_retries:
+                        continue
+                    return "fail", f"DEM 下载失败: {z}/{x}/{y}"
+                except Exception as e:
+                    if attempt < max_retries:
+                        continue
+                    return "fail", f"DEM 错误: {z}/{x}/{y} - {str(e)}"
+
+            return "fail", f"DEM 下载失败: {z}/{x}/{y}"
+
+    async def download_tiles_async(self, region: str, zoom_min: int = 5, zoom_max: int = 12,
+                                   max_concurrent: int = 120, max_retries: int = 3, retry_delay: float = 1.0):
+        self.current_download["is_downloading"] = True
+        self.current_download["region"] = region
+        self.current_download["logs"] = []
+
+        self.add_log(f"⛰ 开始下载 {region} 的 GSI DEM", "info")
+        self.add_log(f"📍 DEM 缩放级别: {zoom_min} - {zoom_max}（最高 14）", "info")
+
+        try:
+            tiles = self.generate_tile_list(region, zoom_min, zoom_max)
+            total = len(tiles)
+            self.current_download.update({
+                "total": total,
+                "current": 0,
+                "success": 0,
+                "skip": 0,
+                "fail": 0,
+                "progress": 0,
+            })
+            self.add_log(f"📊 共需下载 {total} 个 DEM 瓦片", "info")
+            self.add_log(f"💾 保存路径: {self.output_dir.absolute()}", "info")
+
+            connector = aiohttp.TCPConnector(limit=0)
+            timeout = aiohttp.ClientTimeout(total=30)
+            semaphore = asyncio.Semaphore(max_concurrent)
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                headers={'User-Agent': 'Mozilla/5.0 (GSI-DEM-downloader)'}
+            ) as session:
+                tasks = [
+                    self.download_single_tile_async(session, tile, semaphore, max_retries, retry_delay)
+                    for tile in tiles
+                ]
+                for future in asyncio.as_completed(tasks):
+                    status, message = await future
+                    if status in ("skip", "skip_404"):
+                        self.current_download["skip"] += 1
+                    elif status == "success":
+                        self.current_download["success"] += 1
+                    else:
+                        self.current_download["fail"] += 1
+                        self.add_log(message, "error")
+
+                    with self._lock:
+                        self.current_download["current"] += 1
+                        self.current_download["progress"] = int((self.current_download["current"] / total) * 100) if total else 100
+
+                    if self.current_download["current"] % 50 == 0 or self.current_download["current"] == total:
+                        self.add_log(
+                            f"⏳ DEM 进度: {self.current_download['current']}/{total} ({self.current_download['progress']}%) | "
+                            f"✅ {self.current_download['success']} | "
+                            f"⏭️ {self.current_download['skip']} | "
+                            f"❌ {self.current_download['fail']}",
+                            "info"
+                        )
+
+            self.generate_metadata(region, zoom_min, zoom_max, total)
+            self.add_log("✨ DEM 下载完成!", "success")
+        except Exception as e:
+            self.add_log(f"DEM 下载任务失败: {str(e)}", "error")
+        finally:
+            self.current_download["is_downloading"] = False
+
+    def download_tiles_api(self, region: str, zoom_min: int = 5, zoom_max: int = 12,
+                           max_workers: int = 120, max_retries: int = 3, retry_delay: float = 1.0):
+        asyncio.run(self.download_tiles_async(region, zoom_min, zoom_max, max_workers, max_retries, retry_delay))
+
+    def generate_metadata(self, region: str, zoom_min: int, zoom_max: int, total_tiles: int):
+        metadata = {
+            "region": region,
+            "zoom_levels": {"min": zoom_min, "max": zoom_max},
+            "total_tiles": total_tiles,
+            "download_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "tile_source": "日本国土地理院 (GSI Japan) DEM PNG",
+            "base_url": self.base_url,
+            "directory_structure": "gsi_dem_cache/{z}/{x}/{y}.png"
+        }
+        metadata_path = self.output_dir / f"metadata_{region}.json"
+        with open(metadata_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        self.add_log(f"📄 DEM 元数据已保存: metadata_{region}.json", "success")
+
+    def get_stats(self):
+        zoom_levels = sorted([int(d.name) for d in self.output_dir.iterdir()
+                             if d.is_dir() and d.name.isdigit()])
+
+        total_files = 0
+        total_size = 0
+        stats = []
+        for z in zoom_levels:
+            z_dir = self.output_dir / str(z)
+            files = list(z_dir.rglob("*.png"))
+            size = sum(f.stat().st_size for f in files)
+            total_files += len(files)
+            total_size += size
+            stats.append({
+                "level": z,
+                "count": len(files),
+                "size_mb": round(size / 1024 / 1024, 2)
+            })
+
+        return {
+            "stats": stats,
+            "total_files": total_files,
+            "total_size_mb": round(total_size / 1024 / 1024, 2)
+        }
+
+
+# ============================================
+# PLATEAU 3D Tiles 下载器
+# ============================================
+
+class PlateauDownloader:
+    """递归下载 PLATEAU 3D Tiles 数据集（tileset.json + 子tileset + b3dm/glb）"""
+
+    def __init__(self, output_dir: str = "./plateau_tiles"):
+        script_dir = Path(__file__).parent.absolute()
+        self.output_dir = script_dir / output_dir
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        # dataset_id -> {status, files, bytes, errors, ...}
+        self.downloads: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def _sanitize_id(dataset_id: str) -> str:
+        """防止路径遍历，只保留字母数字和 _ - ."""
+        return "".join(c for c in dataset_id if c.isalnum() or c in "_-.")
+
+    def dataset_dir(self, dataset_id: str) -> Path:
+        return self.output_dir / self._sanitize_id(dataset_id)
+
+    def is_local(self, dataset_id: str) -> bool:
+        d = self.dataset_dir(dataset_id)
+        return (d / "tileset.json").exists() and (d / ".complete").exists()
+
+    def list_local(self) -> List[Dict]:
+        """列出本地已下载的数据集（含大小）"""
+        results = []
+        if not self.output_dir.exists():
+            return results
+        for d in self.output_dir.iterdir():
+            if not d.is_dir():
+                continue
+            root = d / "tileset.json"
+            complete_marker = d / ".complete"
+            if not root.exists() or not complete_marker.exists():
+                continue
+            try:
+                size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+                count = sum(1 for _ in d.rglob("*") if _.is_file())
+                content_count = sum(
+                    1 for f in d.rglob("*")
+                    if f.is_file() and f.suffix.lower() in {".b3dm", ".glb"}
+                )
+            except Exception:
+                size, count, content_count = 0, 0, 0
+            if content_count == 0:
+                continue
+            results.append({
+                "dataset_id": d.name,
+                "size_mb": round(size / 1024 / 1024, 2),
+                "files": count,
+                "content_files": content_count,
+            })
+        return results
+
+    def get_status_snapshot(self) -> Dict:
+        with self._lock:
+            return copy.deepcopy(self.downloads)
+
+    def _collect_uris(self, node: Dict, parent_url: str, out: List[str]):
+        """递归从 tile node 收集所有 content URI（解析为绝对 URL）"""
+        if "content" in node and isinstance(node["content"], dict):
+            uri = node["content"].get("uri") or node["content"].get("url")
+            if uri and not uri.startswith("data:"):
+                out.append(urljoin(parent_url, uri))
+        for child in node.get("children") or []:
+            self._collect_uris(child, parent_url, out)
+
+    @staticmethod
+    def _url_to_relpath(url: str, base_url: str) -> str:
+        """把 URL 转成相对 base 的本地路径"""
+        if url.startswith(base_url):
+            rel = url[len(base_url):]
+            return rel.split("?")[0]
+        return urlsplit(url).path.lstrip("/").split("?")[0]
+
+    async def _fetch_one(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        base_url: str,
+        dataset_dir: Path,
+        sem: asyncio.Semaphore,
+        sub_uri_lists: List[List[str]],
+        dataset_id: str,
+        max_retries: int = 3,
+    ):
+        async with sem:
+            rel = self._url_to_relpath(url, base_url)
+            if not rel:
+                return
+            out_path = dataset_dir / rel
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # 已下载：如果是 json 还要解析子节点
+            if out_path.exists():
+                if url.endswith(".json"):
+                    try:
+                        ts = json.loads(out_path.read_bytes())
+                        uris: List[str] = []
+                        if "root" in ts:
+                            self._collect_uris(ts["root"], url, uris)
+                        sub_uri_lists.append(uris)
+                    except Exception:
+                        pass
+                return
+
+            for attempt in range(max_retries + 1):
+                try:
+                    if attempt > 0:
+                        await asyncio.sleep(1.0 * (2 ** (attempt - 1)))
+                    async with session.get(
+                        url, timeout=aiohttp.ClientTimeout(total=60)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            out_path.write_bytes(data)
+                            with self._lock:
+                                st = self.downloads.get(dataset_id)
+                                if st is not None:
+                                    st["files"] += 1
+                                    st["bytes"] += len(data)
+                            if url.endswith(".json"):
+                                try:
+                                    ts = json.loads(data)
+                                    uris = []
+                                    if "root" in ts:
+                                        self._collect_uris(ts["root"], url, uris)
+                                    sub_uri_lists.append(uris)
+                                except Exception:
+                                    pass
+                            return
+                        elif resp.status == 404:
+                            break
+                except (asyncio.TimeoutError, aiohttp.ClientError):
+                    continue
+                except Exception:
+                    continue
+
+            with self._lock:
+                st = self.downloads.get(dataset_id)
+                if st is not None:
+                    st["errors"] += 1
+
+    async def download_async(
+        self,
+        dataset_id: str,
+        root_url: str,
+        max_concurrent: int = 60,
+    ):
+        dataset_dir = self.dataset_dir(dataset_id)
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        base_url = root_url.rsplit("/", 1)[0] + "/"
+
+        with self._lock:
+            self.downloads[dataset_id] = {
+                "status": "downloading",
+                "files": 0,
+                "bytes": 0,
+                "errors": 0,
+                "depth": 0,
+                "queue_size": 0,
+                "started_at": time.time(),
+                "completed_at": None,
+                "url": root_url,
+                "error_msg": None,
+            }
+
+        sem = asyncio.Semaphore(max_concurrent)
+        timeout = aiohttp.ClientTimeout(total=120)
+
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(root_url) as resp:
+                    if resp.status != 200:
+                        raise RuntimeError(f"根 tileset.json 拉取失败: HTTP {resp.status}")
+                    root_data = await resp.read()
+
+                root_path = dataset_dir / "tileset.json"
+                root_path.write_bytes(root_data)
+                with self._lock:
+                    self.downloads[dataset_id]["files"] = 1
+                    self.downloads[dataset_id]["bytes"] = len(root_data)
+
+                root_ts = json.loads(root_data)
+                queue: List[str] = []
+                if "root" in root_ts:
+                    self._collect_uris(root_ts["root"], root_url, queue)
+
+                downloaded = {root_url}
+                depth = 0
+
+                while queue:
+                    depth += 1
+                    with self._lock:
+                        self.downloads[dataset_id]["depth"] = depth
+                        self.downloads[dataset_id]["queue_size"] = len(queue)
+
+                    sub_uri_lists: List[List[str]] = []
+                    tasks = []
+                    for u in queue:
+                        if u in downloaded:
+                            continue
+                        downloaded.add(u)
+                        tasks.append(self._fetch_one(
+                            session, u, base_url, dataset_dir, sem,
+                            sub_uri_lists, dataset_id
+                        ))
+                    if not tasks:
+                        break
+                    await asyncio.gather(*tasks)
+
+                    new_queue: List[str] = []
+                    for uris in sub_uri_lists:
+                        for u in uris:
+                            if u not in downloaded:
+                                new_queue.append(u)
+                    queue = new_queue
+
+            with self._lock:
+                errors = self.downloads.get(dataset_id, {}).get("errors", 0)
+                self.downloads[dataset_id]["status"] = "done" if errors == 0 else "failed"
+                self.downloads[dataset_id]["completed_at"] = time.time()
+                snapshot = copy.deepcopy(self.downloads[dataset_id])
+
+            complete_marker = dataset_dir / ".complete"
+            if errors == 0:
+                complete_marker.write_text(
+                    json.dumps({
+                        "dataset_id": dataset_id,
+                        "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "files": snapshot.get("files", 0),
+                        "bytes": snapshot.get("bytes", 0),
+                        "errors": errors,
+                    }, ensure_ascii=False, indent=2),
+                    encoding="utf-8"
+                )
+            elif complete_marker.exists():
+                complete_marker.unlink()
+        except Exception as e:
+            complete_marker = dataset_dir / ".complete"
+            if complete_marker.exists():
+                complete_marker.unlink()
+            with self._lock:
+                self.downloads[dataset_id]["status"] = "failed"
+                self.downloads[dataset_id]["error_msg"] = str(e)
+                self.downloads[dataset_id]["completed_at"] = time.time()
+
+    def start_download(self, dataset_id: str, url: str, max_concurrent: int = 60):
+        from threading import Thread
+        def run():
+            asyncio.run(self.download_async(dataset_id, url, max_concurrent))
+        Thread(target=run, daemon=True).start()
+
+
+# ============================================
 # Flask API 服务
 # ============================================
 
@@ -314,6 +780,8 @@ CORS(app)  # 允许跨域
 
 # 初始化下载器
 downloader = JapanMapTileDownloader(output_dir="map_tiles")
+dem_downloader = GsiDemDownloader(regions=downloader.regions, output_dir="gsi_dem_cache")
+plateau_downloader = PlateauDownloader(output_dir="plateau_tiles")
 
 @app.route('/api/regions', methods=['GET'])
 def get_regions():
@@ -361,12 +829,199 @@ def get_status():
 @app.route('/api/stats', methods=['GET'])
 def get_stats():
     """获取下载统计"""
-    return jsonify(downloader.get_stats())
+    try:
+        return jsonify(downloader.get_stats())
+    except Exception:
+        return jsonify({"stats": [], "total_files": 0, "total_size_mb": 0.0})
+
+@app.route('/api/dem/download/start', methods=['POST'])
+def start_dem_download():
+    """开始批量下载 GSI DEM"""
+    data = request.json or {}
+    region = data.get('region', '东京周边')
+    zoom_min = data.get('zoom_min', 5)
+    zoom_max = data.get('zoom_max', 12)
+    max_concurrent = data.get('max_concurrent', 120)
+    max_retries = data.get('max_retries', 3)
+    retry_delay = data.get('retry_delay', 1.0)
+
+    if dem_downloader.current_download["is_downloading"]:
+        return jsonify({"error": "已有 DEM 下载任务在进行中"}), 400
+
+    from threading import Thread
+    thread = Thread(
+        target=dem_downloader.download_tiles_api,
+        args=(region, zoom_min, zoom_max, max_concurrent, max_retries, retry_delay)
+    )
+    thread.start()
+
+    return jsonify({
+        "message": "DEM 下载已开始",
+        "region": region,
+        "max_concurrent": max_concurrent,
+        "max_retries": max_retries,
+        "retry_delay": retry_delay
+    })
+
+@app.route('/api/dem/download/status', methods=['GET'])
+def get_dem_status():
+    """获取 DEM 下载状态"""
+    return jsonify(dem_downloader.current_download)
+
+@app.route('/api/dem/stats', methods=['GET'])
+def get_dem_stats():
+    """获取 DEM 缓存统计"""
+    try:
+        return jsonify(dem_downloader.get_stats())
+    except Exception:
+        return jsonify({"stats": [], "total_files": 0, "total_size_mb": 0.0})
 
 @app.route('/map_tiles/<path:filename>')
 def serve_tiles(filename):
     """提供瓦片文件服务"""
     return send_from_directory(downloader.output_dir, filename)
 
-if __name__ == "__main__":    
+
+# -------- PLATEAU 3D Tiles 路由 --------
+
+@app.route('/api/plateau/download', methods=['POST'])
+def plateau_download_start():
+    """启动一个 PLATEAU 数据集的递归下载"""
+    data = request.json or {}
+    dataset_id = data.get('dataset_id')
+    url = data.get('url')
+    if not dataset_id or not url:
+        return jsonify({"error": "dataset_id 和 url 必填"}), 400
+
+    existing = plateau_downloader.downloads.get(dataset_id)
+    if existing and existing.get("status") == "downloading":
+        return jsonify({
+            "status": "already_running",
+            "dataset_id": dataset_id,
+            "progress": existing,
+        })
+
+    plateau_downloader.start_download(dataset_id, url)
+    return jsonify({"status": "started", "dataset_id": dataset_id})
+
+
+@app.route('/api/plateau/status', methods=['GET'])
+def plateau_status():
+    """所有 PLATEAU 下载任务的实时状态"""
+    return jsonify({"downloads": plateau_downloader.get_status_snapshot()})
+
+
+@app.route('/api/plateau/local', methods=['GET'])
+def plateau_local():
+    """本地已下载的 PLATEAU 数据集列表"""
+    try:
+        return jsonify({"datasets": plateau_downloader.list_local()})
+    except Exception:
+        return jsonify({"datasets": []})
+
+
+@app.route('/plateau_tiles/<path:filename>')
+def serve_plateau(filename):
+    """本地 PLATEAU 3D Tiles 静态服务（供 Cesium 加载）"""
+    return send_from_directory(plateau_downloader.output_dir, filename)
+
+
+# -------- GSI DEM 缓存代理 --------
+# 国土地理院 DEM 服务在中国不稳定（TLS 握手频繁失败），
+# 走 Flask 后端：本地有就直接返，没有就重试拉取并落盘。
+import base64
+import urllib.request
+import urllib.error
+from flask import Response
+
+GSI_DEM_CACHE = dem_downloader.output_dir
+_dem_inflight = {}  # tile key -> threading.Event（避免同一瓦片并发重复拉取）
+_dem_inflight_lock = threading.Lock()
+_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+)
+
+
+@app.route('/map_tiles_3d/<int:z>/<int:x>/<int:y>.png')
+def serve_tiles_3d(z, x, y):
+    """3D 场景专用本地影像瓦片：缺瓦片时返回透明图，避免 Cesium 反复等待 404。"""
+    tile_path = downloader.output_dir / str(z) / str(x) / f"{y}.png"
+    if tile_path.exists():
+        return send_from_directory(downloader.output_dir, f"{z}/{x}/{y}.png")
+    return Response(_TRANSPARENT_PNG, mimetype='image/png')
+
+
+def _fetch_dem_tile(z, x, y, max_retries=3):
+    """同步拉取一个 DEM 瓦片，带重试，写入缓存目录。返回 cache_path 或 None。"""
+    cache_path = GSI_DEM_CACHE / str(z) / str(x) / f"{y}.png"
+    if cache_path.exists():
+        return cache_path
+
+    key = f"{z}/{x}/{y}"
+    # 同瓦片并发去重：第二个请求等待第一个完成
+    with _dem_inflight_lock:
+        ev = _dem_inflight.get(key)
+        if ev is not None:
+            wait_ev = ev
+        else:
+            wait_ev = None
+            _dem_inflight[key] = threading.Event()
+
+    if wait_ev is not None:
+        wait_ev.wait(timeout=30)
+        return cache_path if cache_path.exists() else None
+
+    try:
+        url = f"https://cyberjapandata.gsi.go.jp/xyz/dem_png/{z}/{x}/{y}.png"
+        for attempt in range(max_retries + 1):
+            try:
+                if attempt > 0:
+                    time.sleep(0.6 * (2 ** (attempt - 1)))
+                req = urllib.request.Request(
+                    url,
+                    headers={'User-Agent': 'Mozilla/5.0 (Cesium-GSI-DEM-cache)'},
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status == 200:
+                        body = resp.read()
+                        cache_path.parent.mkdir(parents=True, exist_ok=True)
+                        cache_path.write_bytes(body)
+                        return cache_path
+            except urllib.error.HTTPError as he:
+                if he.code == 404:
+                    return None  # 海上/无数据，直接返 None，前端解释成 404
+                continue
+            except Exception:
+                continue
+        return None
+    finally:
+        with _dem_inflight_lock:
+            ev = _dem_inflight.pop(key, None)
+            if ev is not None:
+                ev.set()
+
+
+@app.route('/gsi-dem/<int:z>/<int:x>/<int:y>.png')
+def serve_gsi_dem(z, x, y):
+    """GSI DEM 瓦片：本地缓存命中即返；否则重试拉取并缓存"""
+    if z > 14 or z < 0:
+        return Response('', status=404)
+    p = _fetch_dem_tile(z, x, y)
+    if p is None or not p.exists():
+        return Response('', status=404)
+    return send_from_directory(GSI_DEM_CACHE, f"{z}/{x}/{y}.png")
+
+
+@app.route('/gsi-dem-local/<int:z>/<int:x>/<int:y>.png')
+def serve_gsi_dem_local(z, x, y):
+    """3D 场景专用 DEM：只读本地缓存，缺失立即 404，避免实时回源拖慢渲染。"""
+    if z > 14 or z < 0:
+        return Response('', status=404)
+    p = GSI_DEM_CACHE / str(z) / str(x) / f"{y}.png"
+    if not p.exists():
+        return Response('', status=404)
+    return send_from_directory(GSI_DEM_CACHE, f"{z}/{x}/{y}.png")
+
+
+if __name__ == "__main__":
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

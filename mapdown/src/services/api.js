@@ -14,8 +14,15 @@ async function request(path, options = {}) {
 export const api = {
   getRegions: () => request('/regions'),
   getStats: () => request('/stats'),
+  getDemStats: () => request('/dem/stats'),
   getDownloadStatus: () => request('/download/status'),
+  getDemDownloadStatus: () => request('/dem/download/status'),
   startDownload: (params) => request('/download/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  }),
+  startDemDownload: (params) => request('/dem/download/start', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(params),

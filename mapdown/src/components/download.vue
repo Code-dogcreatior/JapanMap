@@ -75,6 +75,17 @@
               <span class="spinner"></span>
               引擎采集中...
             </button>
+
+            <button v-if="!isDemDownloading" @click="startDemDownload" class="btn btn-terrain btn-block" :disabled="!canStartDemDownload">
+              <svg class="btn-icon" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 18h16.5M4.5 15.75l3.75-6 3 4.5 2.25-3 6 4.5" />
+              </svg>
+              下载 DEM 高度图
+            </button>
+            <button v-else class="btn btn-downloading btn-block" disabled>
+              <span class="spinner"></span>
+              DEM 采集中...
+            </button>
           </div>
 
           <!-- 进度模块 -->
@@ -104,6 +115,33 @@
               </div>
             </div>
           </div>
+
+          <div v-if="demDownloadStatus.is_downloading" class="progress-module dem-progress">
+            <div class="progress-header">
+              <span class="progress-title">DEM 下载进度</span>
+              <span class="progress-percent">{{ demDownloadStatus.progress }}%</span>
+            </div>
+            <div class="progress-bar-bg">
+              <div class="progress-bar-fill dem-fill" :style="{ width: demDownloadStatus.progress + '%' }"></div>
+            </div>
+            <div class="progress-detail">
+              {{ demDownloadStatus.current.toLocaleString() }} / {{ demDownloadStatus.total.toLocaleString() }} 高度图瓦片
+            </div>
+            <div class="status-metrics">
+              <div class="metric metric-success">
+                <span class="metric-val">{{ demDownloadStatus.success.toLocaleString() }}</span>
+                <span class="metric-label">已保存</span>
+              </div>
+              <div class="metric metric-skip">
+                <span class="metric-val">{{ demDownloadStatus.skip.toLocaleString() }}</span>
+                <span class="metric-label">无数据/命中</span>
+              </div>
+              <div class="metric metric-fail">
+                <span class="metric-val">{{ demDownloadStatus.fail.toLocaleString() }}</span>
+                <span class="metric-label">失败</span>
+              </div>
+            </div>
+          </div>
         </div>
       </aside>
 
@@ -123,7 +161,7 @@
             </button>
           </div>
 
-          <div v-if="stats.total_files > 0" class="dashboard-body">
+          <div v-if="stats.total_files > 0 || demStats.total_files > 0" class="dashboard-body">
             <div class="kpi-row">
               <div class="kpi-box">
                 <span class="kpi-title">总存储用量</span>
@@ -132,6 +170,16 @@
               <div class="kpi-box">
                 <span class="kpi-title">瓦片文件总数</span>
                 <span class="kpi-value">{{ stats.total_files.toLocaleString() }}<small>个</small></span>
+              </div>
+            </div>
+            <div class="kpi-row dem-kpi-row">
+              <div class="kpi-box dem-kpi">
+                <span class="kpi-title">DEM 存储用量</span>
+                <span class="kpi-value text-green">{{ demStats.total_size_mb }}<small>MB</small></span>
+              </div>
+              <div class="kpi-box dem-kpi">
+                <span class="kpi-title">DEM 文件总数</span>
+                <span class="kpi-value">{{ demStats.total_files.toLocaleString() }}<small>个</small></span>
               </div>
             </div>
             <div class="levels-breakdown">
@@ -208,7 +256,25 @@ const downloadStatus = ref({
   logs: []
 });
 
+const demDownloadStatus = ref({
+  is_downloading: false,
+  progress: 0,
+  total: 0,
+  current: 0,
+  success: 0,
+  skip: 0,
+  fail: 0,
+  region: '',
+  logs: []
+});
+
 const stats = ref({
+  stats: [],
+  total_files: 0,
+  total_size_mb: 0
+});
+
+const demStats = ref({
   stats: [],
   total_files: 0,
   total_size_mb: 0
@@ -218,6 +284,7 @@ const logContainer = ref(null);
 const { logs, addLog: addLocalLog } = useLog(logContainer);
 
 const isDownloading = computed(() => downloadStatus.value.is_downloading);
+const isDemDownloading = computed(() => demDownloadStatus.value.is_downloading);
 
 const estimatedTiles = computed(() => {
   const bounds = regionBoundsMap.value[config.value.region];
@@ -227,10 +294,17 @@ const estimatedTiles = computed(() => {
 const canStartDownload = computed(() =>
   config.value.region && config.value.zoomMin <= config.value.zoomMax && !isDownloading.value
 );
+const canStartDemDownload = computed(() =>
+  config.value.region && config.value.zoomMin <= Math.min(config.value.zoomMax, 14) && !isDemDownloading.value
+);
 
 let statusInterval = null;
+let demStatusInterval = null;
 let lastHeartbeatTs = 0;
 let lastProgressKey = '';
+let lastDemLogCount = 0;
+let lastDemHeartbeatTs = 0;
+let lastDemProgressKey = '';
 
 const loadRegions = async () => {
   try {
@@ -257,6 +331,23 @@ const startDownload = async () => {
     startStatusPolling();
   } catch (error) {
     addLocalLog(`调度异常: ${error.message}`, 'error');
+  }
+};
+
+const startDemDownload = async () => {
+  try {
+    await api.startDemDownload({
+      region: config.value.region,
+      zoom_min: config.value.zoomMin,
+      zoom_max: Math.min(config.value.zoomMax, 14)
+    });
+    addLocalLog(`DEM 任务指令已下发，区域=${config.value.region}，调度中...`, 'success');
+    lastDemLogCount = 0;
+    lastDemHeartbeatTs = 0;
+    lastDemProgressKey = '';
+    startDemStatusPolling();
+  } catch (error) {
+    addLocalLog(`DEM 调度异常: ${error.message}`, 'error');
   }
 };
 
@@ -292,12 +383,54 @@ const loadStatus = async () => {
   }
 };
 
+const loadDemStatus = async () => {
+  try {
+    const data = await api.getDemDownloadStatus();
+    demDownloadStatus.value = data;
+
+    if (data.logs && data.logs.length > lastDemLogCount) {
+      const newEntries = data.logs.slice(lastDemLogCount);
+      newEntries.forEach(entry => addLocalLog(entry.message || entry, entry.type || 'info'));
+      lastDemLogCount = data.logs.length;
+    }
+
+    if (data.is_downloading) {
+      const progressKey = `${data.current}/${data.total}/${data.success}/${data.skip}/${data.fail}`;
+      const now = Date.now();
+      if (progressKey !== lastDemProgressKey || now - lastDemHeartbeatTs >= 5000) {
+        addLocalLog(
+          `DEM 下载中: ${data.current}/${data.total} (${data.progress}%) | 成功 ${data.success} | 跳过 ${data.skip} | 失败 ${data.fail}`,
+          'info'
+        );
+        lastDemProgressKey = progressKey;
+        lastDemHeartbeatTs = now;
+      }
+    }
+
+    if (!data.is_downloading && demStatusInterval) {
+      stopDemStatusPolling();
+      loadDemStats();
+    }
+  } catch (error) {
+    addLocalLog(`同步 DEM 状态失败: ${error.message}`, 'error');
+  }
+};
+
 const loadStats = async () => {
   try {
     const data = await api.getStats();
     stats.value = data;
   } catch (error) {
     addLocalLog(`统计数据加载失败: ${error.message}`, 'error');
+  }
+};
+
+const loadDemStats = async () => {
+  try {
+    const data = await api.getDemStats();
+    demStats.value = data;
+  } catch (error) {
+    addLocalLog(`DEM 统计数据加载失败: ${error.message}`, 'error');
   }
 };
 
@@ -313,14 +446,29 @@ const stopStatusPolling = () => {
   }
 };
 
+const startDemStatusPolling = () => {
+  if (demStatusInterval) return;
+  demStatusInterval = setInterval(loadDemStatus, 1000);
+};
+
+const stopDemStatusPolling = () => {
+  if (demStatusInterval) {
+    clearInterval(demStatusInterval);
+    demStatusInterval = null;
+  }
+};
+
 onMounted(() => {
   loadRegions();
   loadStats();
+  loadDemStats();
   loadStatus();
+  loadDemStatus();
 });
 
 onUnmounted(() => {
   stopStatusPolling();
+  stopDemStatusPolling();
 });
 </script>
 
@@ -519,6 +667,22 @@ onUnmounted(() => {
   box-shadow: none;
   cursor: not-allowed;
 }
+.btn-terrain {
+  margin-top: 0.6rem;
+  background: linear-gradient(135deg, #059669, #10b981);
+  color: #fff;
+  box-shadow: 0 4px 10px -2px rgba(16,185,129,0.35);
+}
+.btn-terrain:hover:not(:disabled) {
+  background: linear-gradient(135deg, #047857, #059669);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px -2px rgba(16,185,129,0.45);
+}
+.btn-terrain:disabled {
+  background: #cbd5e1;
+  box-shadow: none;
+  cursor: not-allowed;
+}
 .btn-icon { width: 18px; height: 18px; }
 .btn-downloading {
   background: #f1f5f9;
@@ -539,6 +703,9 @@ onUnmounted(() => {
   border-top: 1px solid #f1f5f9;
   padding: 1.25rem;
   background: #fafafa;
+}
+.dem-progress {
+  background: #f7fdf9;
 }
 .progress-header {
   display: flex;
@@ -562,6 +729,9 @@ onUnmounted(() => {
   background: linear-gradient(90deg, #4f46e5, #818cf8);
   border-radius: 999px;
   transition: width 0.4s ease;
+}
+.progress-bar-fill.dem-fill {
+  background: linear-gradient(90deg, #059669, #34d399);
 }
 .progress-detail {
   font-size: 0.72rem;
@@ -623,6 +793,14 @@ onUnmounted(() => {
 }
 .kpi-value small { font-size: 0.75rem; font-weight: 500; color: #64748b; margin-left: 2px; }
 .text-indigo { color: var(--primary, #4f46e5); }
+.text-green { color: #059669; }
+.dem-kpi-row {
+  margin-top: -0.35rem;
+}
+.dem-kpi {
+  background: linear-gradient(135deg, #f0fdf4, #ecfdf5);
+  border-color: #bbf7d0;
+}
 .levels-breakdown { display: flex; flex-direction: column; gap: 0.55rem; }
 .level-row { display: flex; align-items: center; gap: 0.75rem; font-size: 0.82rem; }
 .level-badge {
